@@ -29,7 +29,7 @@ PID::PID()
      pid Output needs to be computed.  returns true when the output is computed,
      false when nothing has been done.
  **********************************************************************************/
-bool PID::Compute()
+bool PID::Compute(double *mySetpoint)
 {
   if (!inAuto) return false;
   /*Compute all the working error variables*/
@@ -146,11 +146,10 @@ void PID::SetMode(int Mode)
  	does all the things that need to happen to ensure a bumpless transfer
     from manual to automatic mode.
  ******************************************************************************/
-void PID::Initialize(double* Input, double* Output, double* Setpoint, double Kp, double Ki, double Kd, int POn)
+void PID::Initialize(double* Input, double* Output, double Kp, double Ki, double Kd, int POn)
 {
   myOutput = Output;
   myInput = Input;
-  mySetpoint = Setpoint;
   inAuto = false;
 
   PID::SetOutputLimits(0, 255);  //default output limit corresponds to the arduino pwm limits
@@ -176,10 +175,6 @@ void PID::Reset()
  ******************************************************************************/
 int PID::GetMode() {
   return  inAuto ? AUTOMATIC : MANUAL;
-}
-
-double PID::GetSetpoint() {
-  return *mySetpoint;
 }
 
 void PID::ATInitialize(double* Input, double* Output)
