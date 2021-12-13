@@ -9,7 +9,7 @@
 #ifndef OWRemoteDevices_h
 #define OWRemoteDevices_h
 #include <inttypes.h>
-#include <DS2482.h>
+#include "MYDS2482.h"
 
 struct ControlPanelData 
 {
@@ -67,7 +67,7 @@ class OWRemoteDevices
 public:
 
     OWRemoteDevices();
-    OWRemoteDevices(DS2482*);
+    OWRemoteDevices(MYDS2482*);
 
     // initialise bus
     void ScanAll(void);
@@ -95,7 +95,7 @@ public:
     bool getDSTemperature(const uint8_t deviceIndex, float *tempC);
 
     bool GetPanelData(const uint8_t deviceIndex, ControlPanelData *dataptr);
-    void SetPanelData(const uint8_t deviceIndex, ControlPanelData *dataptr);
+    bool SetPanelData(const uint8_t deviceIndex, ControlPanelData *dataptr);
 
 private:
     typedef uint8_t ScratchPad[9];
@@ -105,7 +105,7 @@ private:
     uint8_t TotalSlavesCnt;
 
     // Take a pointer to one wire instance
-    DS2482* _wire;
+    MYDS2482* _wire;
 
     // returns true if address is valid
     bool validAddress(const uint8_t*);

@@ -1,8 +1,21 @@
-/* 
+/*
    Waterfloors Heating System (WHS)
-   - main module firmware (ESP32 microcontroller)
+   - main module firmware (ESP32-S microcontroller with DS8242 + DS3231)
 
-   Written by dUkk (c) 2018-2020 Wholesome Software
+  tested on: ArduinoIDE v1.8.15 + ESP32 Dev Module (CPU Freq 160mhz). SDK was v2.0.0
+
+
+v2.0 (2021-12-13)
++fix bugs in DS2482 code
++introduce checking status of correct settings push to remote panels (in case of error will continue push)
++remove unneeded scratchpad read before pushing remote panel config (speedup)
++restored maintenance cycle in case valve is not used last X days
++added new heatin mode: duty cycle (cycling on->off mode every X seconds)
++added active-pullup mode by default ON on 1W bus
++fix multi-timezone temperature bug
+
+
+   Written by dUkk (c) 2018-2021 Wholesome Software
 */
 
 #include <Wire.h>
@@ -13,7 +26,7 @@
 #include <driver/rtc_io.h>
 #include <driver/adc.h>
 #include <RtcDS3231.h>
-#include <DS2482.h>
+#include "MYDS2482.h"
 #include "OWRemoteDevices.h"
 #include "PIDLib.h"
 
@@ -27,6 +40,7 @@
 #define HEATER_MODE_PIDTUNE 1
 #define HEATER_MODE_PID_SINGLEZONE 2
 #define HEATER_MODE_PID_MULTIZONE 3
+#define HEATER_MODE_DUTYCYCLE 4
 
 #define SSID_NAME "bssid"
 #define SSID_PASSWORD "wifipassword"
@@ -35,12 +49,13 @@
 
 #define RUNCYCLE_FREQ 20 //panels and sensors data grab cycle and PID compute cycle will run at this interval (in seconds)
 #define VALVE_PWM_CYCLES 6 //TRIAC opening or closing valve window. VALVE_PWM_CYCLES*RUNCYCLE_FREQ (in seconds)
+#define VALVE_INACTIVE_MAX_SECONDS 345600  //this is maximum valve inactive state in seconds before we start 15minutes cycle opening and closing it
+#define VALVE_MAINTENANCE_SECONDS 900 //how long valve should be opened in case of its inactive state
 
 RtcDS3231<TwoWire> Rtc(Wire);
 //1wire switch instance  0 = 0x18 address
-DS2482 DS2482(0, &Wire);
-//slaves
-OWRemoteDevices OneWireBus(&DS2482);
+MYDS2482 OWSwitch(0);
+OWRemoteDevices OneWireBus(&OWSwitch);
 
 RTC_DATA_ATTR uint32_t nextTimeConnect, NextRunCycleTS;
 bool first_time;
@@ -65,6 +80,8 @@ struct HEATER_PANEL {
   double TZoneDesiredTemp[3];
   //for fixed everytime tempepature
   double desiredTemp;
+  //for Hysteresis type control
+  uint32_t DutyCyclesMax;
 };
 
 struct {
@@ -81,11 +98,12 @@ struct {
   uint16_t SensorErrorsOnBus;
   uint32_t PanellastOnline;
   uint32_t SensorlastOnline;
-  int8_t NumberOfCycles;
+  uint32_t NumberOfCycles;
+  uint32_t LastuseTS;
   //GPIO pin number of ESP32
   uint8_t Pin;
   //this holds pointer (to HEATER_PANEL[n].) to not recalculate N-times current selected temperature
-  double *ptrToCurSettemp; 
+  double *ptrToCurSettemp;
   //flag to send autotune calibration data to server
   bool PIDTuneReady;
   //flag to push current config to remote panel
@@ -113,10 +131,13 @@ RTC_DATA_ATTR rtcData_WIFI rtcData;
 PID PIDHeaterMachinery[4];
 
 unsigned int CRC16(unsigned char *buf, int len);
-String extractParam(String& authReq, const String& param, const char delimit);
+String extractParam(const String &authReq, const String &param);
 bool is_between(const int32_t value, const int32_t rangestart, const int32_t rangeend);
+void ParseServerResponse(String &payload, String &value);
 uint8_t GetDeviceIndex(const int32_t HWAddress);
-double *GetSetTempForZone(uint8_t PanelIdx, uint32_t CurTime);
+bool AssignProperSetTemp(uint8_t PanelIdx, uint32_t CurTime);
+void SpinPIDHeatersCycle(uint32_t CurTS);
+void UpdateHeatersLastuse(uint32_t TS);
 bool PushToControlPanel(uint8_t PanelIdx, uint8_t deviceIdx);
 void ScanOWBus();
 void saveSettings();
@@ -130,15 +151,34 @@ void setup()
 #ifdef DEBUG
   Serial.begin(115200);
   delay(10);
-  Serial.printf("our settings size array %d\n", sizeof(settings));
+  Serial.printf("our settings struct size: %d , I2C: SDA=%d SCL=%d\r\n", sizeof(settings), SDA, SCL);
 #endif
   EEPROM.begin(sizeof(settings));
+
+#ifdef DEBUG
+  byte error, address;
+  Serial.printf("I2C init=%d\r\n",  Wire.begin(SDA, SCL));
+  for(address = 1; address < 127; address++ )
+  {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    if (error == 0)
+    {
+      Serial.print("I2C device found at address 0x");
+      if (address<16)
+        Serial.print("0");
+      Serial.print(address,HEX);
+      Serial.println("  !");
+    }
+  }
+#else
   Wire.begin(SDA, SCL);
+#endif
 
   pinMode(26, OUTPUT); //GPIO26 = valve1
   pinMode(25, OUTPUT); //GPIO25 = valve2
-  pinMode(33, OUTPUT);//pinMode(33, OUTPUT); //GPIO33 = valve3
-  pinMode(32, OUTPUT);//pinMode(32, OUTPUT); //GPIO32 = valve4
+  pinMode(33, OUTPUT); //GPIO33 = valve3
+  pinMode(32, OUTPUT); //GPIO32 = valve4
   pinMode(35, OUTPUT); //GPIO35 = Pump relay off
   pinMode(34, OUTPUT); //GPIO34 = Pump relay on
 
@@ -148,19 +188,19 @@ void setup()
   digitalWrite(32, LOW); //Initial state
   digitalWrite(35, LOW); //Initial state
   digitalWrite(34, LOW); //Initial state
- 
+
   loadSettings();
   WiFi.persistent(false);
   WiFi.setAutoConnect(false);
   WiFi.setAutoReconnect(false);
   WiFi.mode(WIFI_OFF);
   btStop();
-  
-  if (!Rtc.IsDateTimeValid()) 
+
+  if (!Rtc.IsDateTimeValid())
   {
 #ifdef DEBUG
     Serial.print("RTC invalid TS, resetting it\n");
-#endif    
+#endif
       RtcDateTime compiled = RtcDateTime(__DATE__, __TIME__);
       Rtc.SetDateTime(compiled);
   }
@@ -180,11 +220,12 @@ void setup()
   Rtc.SetSquareWavePin(DS3231SquareWavePin_ModeNone);
 
 #ifdef DEBUG
-  Serial.printf("1W switch reset %d\n", DS2482.reset());
+  Serial.printf("1W switch reset %d\n", OWSwitch.reset());
+  Serial.printf("1W switch APU %d\n", OWSwitch.configure(DS2482_CONFIG_APU));
 #else
-  DS2482.reset();
+  OWSwitch.reset();
+  OWSwitch.configure(DS2482_CONFIG_APU);
 #endif
-  //DS2482.configure(DS2482_CONFIG_APU);
 
   //wait until all remote control panels is booted up
   //while we are waiting -> illuminate valve control LEDs for one second
@@ -226,9 +267,11 @@ void loop()
 
   if (dt.TotalSeconds() >= NextRunCycleTS)
   {
+#ifdef DEBUG
     char datestring[20];
     snprintf_P(datestring, 20, PSTR("%02u/%02u/%04u %02u:%02u:%02u\r\n"),  dt.Month(), dt.Day(), dt.Year(), dt.Hour(), dt.Minute(), dt.Second());
     Serial.print(datestring);
+#endif
 
     //sensors and panels data accqusion may consume more than RUNCYCLE_FREQ seconds. so we must calculate next real delay to call Run cycle monotonically
     NextRunCycleTS = dt.TotalSeconds() + RUNCYCLE_FREQ;
@@ -247,7 +290,6 @@ void loop()
 
     //consume data from remote sensors and panels
     ControlPanelData data;
-    float tempC;
     for (uint8_t i = 0; i < OneWireBus.getDeviceCount(); i++)
     {
       //map this sensor to our internal idx
@@ -259,17 +301,9 @@ void loop()
 
       if (OneWireBus.getDeviceType(i) == OURMODEL)
       {
-        double *ptr = GetSetTempForZone(idx, SecondsSinceZZ);
-        //compare OLD (current) settemp with potentially new (by time)
-        if(*RunningValues[idx].ptrToCurSettemp != *ptr)
-        {
-#ifdef DEBUG
-          Serial.printf("comparing OLD (cur) settemp with next one DIFFERENT -> force panel pushing config\r\n");
-#endif
-          //update pointer and set flag
-          RunningValues[idx].ptrToCurSettemp = ptr;
-          RunningValues[idx].NeedPushConfig=true;
-        }
+        //do we need change current SetTemp assigned variable by Time constraints? (preserve current PUSH status!)
+        if(AssignProperSetTemp(idx, SecondsSinceZZ)) RunningValues[idx].NeedPushConfig=true;
+
         //check is we need to refresh its settings?
         if(RunningValues[idx].NeedPushConfig)
         {
@@ -280,47 +314,62 @@ void loop()
 #endif
               RunningValues[idx].NeedPushConfig=false;
             }
-#ifdef DEBUG            
+#ifdef DEBUG
             else {
               Serial.printf("CONFIG PUSH ERROR!\r\n");
             }
-#endif            
+#endif
             //delay next operation because panel needs some time to do work (write config values and retrieve sensor readings)
             delay(150);
         }
+
         //next is obtain values
         if (OneWireBus.GetPanelData(i, &data))
         {
 #ifdef DEBUG
           Serial.printf(" slave #%d (addr: %d), returned CurrentTemp:%f, SetTemp:%f, Humidity:%d, Mode:%d, TOffset:%f\r\n", i, OneWireBus.getDeviceHWAddress(i), data.CurTemp, data.ReqTemp, data.CurHumidity, data.CurMode, data.toffset);
 #endif
-          *RunningValues[idx].ptrToCurSettemp = data.ReqTemp;
-          settings.HeaterConfig[idx].toffset = data.toffset;
-          //settings.HeaterConfig[idx].hoffset
-          //if remote mode is changed
-          if (data.CurMode != settings.HeaterConfig[idx].CurrentMode)
+          //ignore readed settings if we failed push FRESH server settings to panel
+          if(!RunningValues[idx].NeedPushConfig)
           {
-#ifdef DEBUG
-            Serial.printf("panel changed MODE via panel\r\n");
-#endif
-            settings.HeaterConfig[idx].CurrentMode = data.CurMode;
-            //for PID or AUTOTUNE -> initialize it
-            if (settings.HeaterConfig[idx].CurrentMode == HEATER_MODE_PIDTUNE)
-              PIDHeaterMachinery[idx].ATCancel();
-            else if (settings.HeaterConfig[idx].CurrentMode >= HEATER_MODE_PID_SINGLEZONE)
-            {
-              PIDHeaterMachinery[idx].Reset();
-              PIDHeaterMachinery[idx].SetMode(AUTOMATIC);
-            }
+              settings.HeaterConfig[idx].toffset = data.toffset;
+              //settings.HeaterConfig[idx].hoffset
+              //if remote mode is changed
+              if (data.CurMode != settings.HeaterConfig[idx].CurrentMode)
+              {
+    #ifdef DEBUG
+                Serial.printf("panel %d changed MODE via panel\r\n", i);
+    #endif
+                settings.HeaterConfig[idx].CurrentMode = data.CurMode;
+                //for PID or AUTOTUNE -> initialize it
+                if (settings.HeaterConfig[idx].CurrentMode == HEATER_MODE_PIDTUNE)
+                  PIDHeaterMachinery[idx].ATCancel();
+                else if (settings.HeaterConfig[idx].CurrentMode >= HEATER_MODE_PID_SINGLEZONE && settings.HeaterConfig[idx].CurrentMode <= HEATER_MODE_PID_MULTIZONE)
+                {
+                  PIDHeaterMachinery[idx].Reset();
+                  PIDHeaterMachinery[idx].SetMode(AUTOMATIC);
+                }
+                else if(settings.HeaterConfig[idx].CurrentMode == HEATER_MODE_DUTYCYCLE)
+                {
+                  RunningValues[idx].NumberOfCycles = 1;
+                }
+                AssignProperSetTemp(idx, SecondsSinceZZ);
+              }
+              *RunningValues[idx].ptrToCurSettemp = data.ReqTemp;  //save SetTemp to CURRENT selected variable
           }
+#ifdef DEBUG
+          else
+          {
+            Serial.printf(" slave panel #%d (addr: %d) is in push-settings state, ignored its data\r\n", i, OneWireBus.getDeviceHWAddress(i));
+          }
+#endif
+          //anyway sensor readings is fine
           RunningValues[idx].input = data.CurTemp;
           RunningValues[idx].humidity = data.CurHumidity;
           RunningValues[idx].PanellastOnline = dt.TotalSeconds();
           RunningValues[idx].PanelErrorsOnBus = OneWireBus.getDeviceErrorsCount(i);
 #ifdef DEBUG
-          Serial.printf(" slave panel #%d (addr: %d), requesting next measurement. status=%d\r\n", i, OneWireBus.getDeviceHWAddress(i), OneWireBus.requestDataMetering(i));
-#else
-          OneWireBus.requestDataMetering(i); //this will request next measurement and put device to sleep 
+          Serial.printf(" slave panel #%d (addr: %d) processed telemetry\r\n", i, OneWireBus.getDeviceHWAddress(i));
 #endif
         }
         else
@@ -333,19 +382,13 @@ void loop()
       }
       else
       {
-        if (OneWireBus.getDSTemperature(i, &tempC))
+        if (OneWireBus.getDSTemperature(i, &RunningValues[idx].ValveTemp))
         {
 #ifdef DEBUG
-          Serial.printf(" slave #%d SensorTemp=%f\r\n", i, tempC);
+          Serial.printf(" slave #%d SensorTemp=%f\r\n", i, RunningValues[idx].ValveTemp);
 #endif
-          RunningValues[idx].ValveTemp = tempC;
           RunningValues[idx].SensorlastOnline = dt.TotalSeconds();
           RunningValues[idx].SensorErrorsOnBus = OneWireBus.getDeviceErrorsCount(i);
-#ifdef DEBUG
-          Serial.printf(" slave sensor #%d requesting next measurement! status=%d\r\n", i, OneWireBus.requestDataMetering(i));
-#else
-          OneWireBus.requestDataMetering(i);
-#endif
         }
         else
         {
@@ -355,75 +398,17 @@ void loop()
 #endif
         }
       }
+
+      //
+#ifdef DEBUG
+      Serial.printf(" slave #%d (addr: %d), requesting next measurement. status=%d\r\n", i, OneWireBus.getDeviceHWAddress(i), OneWireBus.requestDataMetering(i));
+#else
+      OneWireBus.requestDataMetering(i);
+#endif
     }
 
     //now spinup PID cycles
-    for (uint8_t idx = 0; idx < 4; idx++)
-    {
-      if (settings.HeaterConfig[idx].CurrentMode == HEATER_MODE_OFF)
-      {
-        digitalWrite(RunningValues[idx].Pin, LOW);
-#ifdef DEBUG
-        Serial.printf("HEATER%d MANUAL OFF on GPIO %d\r\n", idx, RunningValues[idx].Pin);
-#endif
-      }
-      //PID loop calibration loop mode
-      else if (settings.HeaterConfig[idx].CurrentMode == HEATER_MODE_PIDTUNE)
-      {
-          if (PIDHeaterMachinery[idx].ATCompute())
-          {
-#ifdef DEBUG
-          Serial.printf("HEATER%d Autotune DONE\r\n", idx);
-#endif
-            //was done, get P I D values
-            RunningValues[idx].PIDTuneReady = true;
-            settings.HeaterConfig[idx].CurrentMode = HEATER_MODE_OFF;
-            //flag: in NEXT polling cycle we should push new settings to panel
-            RunningValues[idx].NeedPushConfig = true;
-          }
-
-          if ((RunningValues[idx].output * VALVE_PWM_CYCLES) / 100 >= RunningValues[idx].NumberOfCycles)
-          {
-#ifdef DEBUG
-            Serial.printf("PIDCal HEATER%d PID.input=%f PID.output=%f Cycles=%d ON\r\n", idx, RunningValues[idx].input, RunningValues[idx].output, RunningValues[idx].NumberOfCycles);
-#endif
-            digitalWrite(RunningValues[idx].Pin, HIGH);
-            RunningValues[idx].OnTimeCount += RUNCYCLE_FREQ;
-          }
-          else
-          {
-#ifdef DEBUG
-            Serial.printf("PIDCal HEATER%d PID.input=%f PID.output=%f Cycles=%d OFF\r\n", idx, RunningValues[idx].input, RunningValues[idx].output, RunningValues[idx].NumberOfCycles);
-#endif
-            digitalWrite(RunningValues[idx].Pin, LOW);
-          }
-          RunningValues[idx].NumberOfCycles++;
-          if(RunningValues[idx].NumberOfCycles > VALVE_PWM_CYCLES) RunningValues[idx].NumberOfCycles=1;
-      }
-      //PID heating two modes
-      else if (settings.HeaterConfig[idx].CurrentMode >= HEATER_MODE_PID_SINGLEZONE)
-      {
-          PIDHeaterMachinery[idx].Compute(RunningValues[idx].ptrToCurSettemp);
-
-          if ((RunningValues[idx].output * VALVE_PWM_CYCLES) / 100 >= RunningValues[idx].NumberOfCycles)
-          {
-#ifdef DEBUG
-            Serial.printf("HEATER%d PID.input=%f PID.output=%f SetPoint=%f Cycles=%d ON\r\n", idx, RunningValues[idx].input, RunningValues[idx].output, *RunningValues[idx].ptrToCurSettemp, RunningValues[idx].NumberOfCycles);
-#endif
-            digitalWrite(RunningValues[idx].Pin, HIGH);
-            RunningValues[idx].OnTimeCount += RUNCYCLE_FREQ;
-          }
-          else
-          {
-#ifdef DEBUG
-            Serial.printf("HEATER%d PID.input=%f PID.output=%f SetPoint=%f Cycles=%d OFF\r\n", idx, RunningValues[idx].input, RunningValues[idx].output, *RunningValues[idx].ptrToCurSettemp, RunningValues[idx].NumberOfCycles);
-#endif
-            digitalWrite(RunningValues[idx].Pin, LOW);
-          }
-          RunningValues[idx].NumberOfCycles++;
-          if(RunningValues[idx].NumberOfCycles > VALVE_PWM_CYCLES) RunningValues[idx].NumberOfCycles=1;
-      }    
-    }
+    SpinPIDHeatersCycle(dt.TotalSeconds());
   }
 
   //check is we need to connect with server?
@@ -432,18 +417,22 @@ void loop()
 #ifdef DEBUG
     Serial.printf("curts=%d , %d seconds elapsed, time to connect to server (next %d)\r\n", dt.TotalSeconds(), settings.ConnInterval, nextTimeConnect);
 #endif
+
+    //here we see is in elapsed time interval heater is ON sometime
+    UpdateHeatersLastuse(dt.TotalSeconds());
+
     if (InitiateWIFI())
     {
       HTTPClient http;
-      String payload, value;
-      payload.concat(F("/senshandle.php?hid="));
-      payload.concat(WiFi.getHostname());
+      String value;
+      value.concat(F("/senshandle.php?hid="));
+      value.concat(WiFi.getHostname());
       if (first_time)
       {
-        payload += "&boot=";
-        payload.concat((int)rtc_get_reset_reason(0));
+        value += "&boot=";
+        value.concat((int)rtc_get_reset_reason(0));
       }
-      http.begin(F(HTTP_HOST), 80, payload);
+      http.begin(F(HTTP_HOST), 80, value);
       http.addHeader("Content-Type", "application/octet-stream");
       //serialize data to XML
       value = "<settings vbatt=\"";
@@ -496,7 +485,7 @@ void loop()
           value.concat(PIDHeaterMachinery[i].ATGetKd());
         }
         value += "\" />";
-        
+
         RunningValues[i].OnTimeCount = 0;
       }
       value += "</settings>";
@@ -507,8 +496,82 @@ void loop()
       if (httpCode == HTTP_CODE_OK)
       {
         if (first_time) first_time = false;
-        payload = http.getString();
-        value = extractParam(payload, "TIMESTAMP=", '&');
+        ParseServerResponse(http.getString(), value);
+      }
+      //set next connect timestamp
+      dt = Rtc.GetDateTime();
+      nextTimeConnect = dt.TotalSeconds() + settings.ConnInterval;
+    }
+    //missed connect let's retry fastly
+    else
+    {
+#ifdef DEBUG
+      Serial.printf("missing WIFI connection, will retry 10seconds later\r\n");
+#endif
+      dt = Rtc.GetDateTime();
+      nextTimeConnect = dt.TotalSeconds() + 10;
+    }
+    ShutdownWIFI();
+  }
+
+  //determine how much seconds we allowed to powerdown MCU?
+  //either WIFI or RUN cycles come first
+  int32_t seconds = 0;
+#ifdef DEBUG
+  Serial.printf("nextTimeConnect=%d  NextRunCycleTS=%d\r\n", nextTimeConnect, NextRunCycleTS);
+#endif
+  if (nextTimeConnect > NextRunCycleTS)
+  {
+    seconds = NextRunCycleTS - dt.TotalSeconds();
+  }
+  else
+  {
+    seconds = nextTimeConnect - dt.TotalSeconds();
+  }
+
+  if (seconds > 0)
+  {
+#ifdef DEBUG
+    Serial.printf("allowed powerdown for %d seconds\r\n", seconds);
+#endif
+    esp_sleep_enable_timer_wakeup(seconds * 1000000);
+
+#ifdef DEBUG
+    for (int a = 0; a < 4; a++) Serial.printf("[%d] = %d\r\n", a, digitalRead(RunningValues[a].Pin));
+#endif
+    if (digitalRead(GPIO_NUM_26))
+      gpio_hold_en(GPIO_NUM_26);
+    if (digitalRead(GPIO_NUM_25))
+      gpio_hold_en(GPIO_NUM_25);
+    if (digitalRead(GPIO_NUM_33))
+      gpio_hold_en(GPIO_NUM_33);
+    if (digitalRead(GPIO_NUM_32))
+      gpio_hold_en(GPIO_NUM_32);
+
+    gpio_deep_sleep_hold_en();
+    WiFi.mode(WIFI_OFF);
+
+    esp_light_sleep_start();
+#ifdef DEBUG
+    Serial.println("waked from powerdown GPIO states:\r\n");
+    for (int a = 0; a < 4; a++) Serial.printf("[%d] = %d\r\n", a, digitalRead(RunningValues[a].Pin));
+#endif
+
+    gpio_hold_dis(GPIO_NUM_26);
+    gpio_hold_dis(GPIO_NUM_25);
+    gpio_hold_dis(GPIO_NUM_33);
+    gpio_hold_dis(GPIO_NUM_32);
+
+#ifdef DEBUG
+    Serial.println("after gpio_hold_dis\r\n");
+    for (int a = 0; a < 4; a++) Serial.printf("[%d] = %d\r\n", a, digitalRead(RunningValues[a].Pin));
+#endif
+  }
+}
+
+void ParseServerResponse(String payload, String &value)
+{
+        value = extractParam(payload, "TIMESTAMP=");
         if (value.length() > 0)
         {
           RtcDateTime TSsync(value.toInt());
@@ -518,35 +581,36 @@ void loop()
           Serial.printf("OUR TimeStamp %d server %d\r\n", dt.TotalSeconds(), TSsync.TotalSeconds());
 #endif
           //if difference is too big - sync RTC
-          if (abs(TSsync.TotalSeconds() - dt.TotalSeconds()) > 10)
+          //if (abs(TSsync.TotalSeconds() - dt.TotalSeconds()) > 5)
+          if((TSsync.TotalSeconds() > dt.TotalSeconds() ? TSsync.TotalSeconds() - dt.TotalSeconds() : dt.TotalSeconds() - TSsync.TotalSeconds()) > 5)
           {
             uint32_t elapsed = NextRunCycleTS - dt.TotalSeconds();
             Rtc.SetDateTime(TSsync);
             //need restart our RUN cycle but take care of elapsed already time
             NextRunCycleTS = TSsync.TotalSeconds() + (RUNCYCLE_FREQ - elapsed);
 #ifdef DEBUG
-            Serial.printf("our clock is skew %d seconds from server timestamp! - RESYNCing (RUNCycle elapsed %d)\r\n", abs(TSsync.TotalSeconds() - dt.TotalSeconds()), elapsed);
+            Serial.printf("our clock is skew %d seconds from server timestamp! - RESYNCing (RUNCycle elapsed %d)\r\n", (TSsync.TotalSeconds() > dt.TotalSeconds() ? TSsync.TotalSeconds() - dt.TotalSeconds() : dt.TotalSeconds() - TSsync.TotalSeconds()), elapsed);
 #endif
           }
         }
-        value = extractParam(payload, "SSID=", '&');
+        value = extractParam(payload, "SSID=");
         if (value.length() > 0)
         {
           strcpy(settings.ssid, value.c_str());
         }
-        value = extractParam(payload, "PASSWD=", '&');
+        value = extractParam(payload, "PASSWD=");
         if (value.length() > 0)
         {
           strcpy(settings.password, value.c_str());
         }
-        value = extractParam(payload, "CONINT=", '&');
+        value = extractParam(payload, "CONINT=");
         if (value.length() > 0)
         {
           settings.ConnInterval = value.toInt();
           if (settings.ConnInterval < 10) settings.ConnInterval = 10;
           else if (settings.ConnInterval > 10000) settings.ConnInterval = 10000;
         }
-        value = extractParam(payload, "TXPWR=", '&');
+        value = extractParam(payload, "TXPWR=");
         if (value.length() > 0)
         {
           switch (value.toInt())
@@ -589,16 +653,16 @@ void loop()
               break;
           }
         }
-        value = extractParam(payload, "SCANBUS=", '&');
+        value = extractParam(payload, "SCANBUS=");
         if (value.length() > 0)
         {
 #ifdef DEBUG
           Serial.printf("OW bus scan\r\n");
 #endif
-          DS2482.reset();
+          OWSwitch.reset();
           ScanOWBus();
         }
-        value = extractParam(payload, "CONFSAVE=", '&');
+        value = extractParam(payload, "CONFSAVE=");
         if (value.length() > 0)
         {
 #ifdef DEBUG
@@ -606,7 +670,7 @@ void loop()
 #endif
           saveSettings();
         }
-        value = extractParam(payload, "REBOOT=", '&');
+        value = extractParam(payload, "REBOOT=");
         if (value.length() > 0)
         {
 #ifdef DEBUG
@@ -615,7 +679,7 @@ void loop()
           ESP.restart();
         }
         //==============================PANEL 1 configuration ===============================
-        value = extractParam(payload, "H1MODE=", '&');
+        value = extractParam(payload, "H1MODE=");
         if (value.length() > 0)
         {
           uint8_t prevmode = settings.HeaterConfig[0].CurrentMode;
@@ -630,13 +694,17 @@ void loop()
               PIDHeaterMachinery[0].Reset();
               PIDHeaterMachinery[0].SetMode(AUTOMATIC);
             }
+            else if(settings.HeaterConfig[0].CurrentMode == HEATER_MODE_DUTYCYCLE)
+            {
+              RunningValues[0].NumberOfCycles = 1;
+            }
             RunningValues[0].NeedPushConfig = true;
 #ifdef DEBUG
             Serial.printf("HEATER1 mode changed\r\n");
 #endif
           }
         }
-        value = extractParam(payload, "H1T1S=", '&');
+        value = extractParam(payload, "H1T1S=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].TZoneStart[0] = value.toInt();
@@ -644,7 +712,7 @@ void loop()
           Serial.printf("HEATER1 TimeZone[0]Start changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H1T1E=", '&');
+        value = extractParam(payload, "H1T1E=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].TZoneEnd[0] = value.toInt();
@@ -652,7 +720,7 @@ void loop()
           Serial.printf("HEATER1 TimeZone[0]End changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H1T2S=", '&');
+        value = extractParam(payload, "H1T2S=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].TZoneStart[1] = value.toInt();
@@ -660,7 +728,7 @@ void loop()
           Serial.printf("HEATER1 TimeZone[1]Start changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H1T2E=", '&');
+        value = extractParam(payload, "H1T2E=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].TZoneEnd[1] = value.toInt();
@@ -668,7 +736,7 @@ void loop()
           Serial.printf("HEATER1 TimeZone[1]End changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H1T3S=", '&');
+        value = extractParam(payload, "H1T3S=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].TZoneStart[2] = value.toInt();
@@ -676,7 +744,7 @@ void loop()
           Serial.printf("HEATER1 TimeZone[2]Start changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H1T3E=", '&');
+        value = extractParam(payload, "H1T3E=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].TZoneEnd[2] = value.toInt();
@@ -684,7 +752,7 @@ void loop()
           Serial.printf("HEATER1 TimeZone[2]End changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H1TEMP=", '&');
+        value = extractParam(payload, "H1TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].desiredTemp = value.toFloat();
@@ -693,23 +761,23 @@ void loop()
           Serial.printf("HEATER1 temp set %f\r\n", settings.HeaterConfig[0].desiredTemp);
 #endif
         }
-        value = extractParam(payload, "H1T1TEMP=", '&');
+        value = extractParam(payload, "H1T1TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].TZoneDesiredTemp[0] = value.toFloat();
 #ifdef DEBUG
           Serial.printf("HEATER1 temp set for timezone [0]\r\n");
 #endif
-        }                
-        value = extractParam(payload, "H1T2TEMP=", '&');
+        }
+        value = extractParam(payload, "H1T2TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].TZoneDesiredTemp[1] = value.toFloat();
 #ifdef DEBUG
           Serial.printf("HEATER1 temp set for timezone [1]\r\n");
 #endif
-        }                
-        value = extractParam(payload, "H1T3TEMP=", '&');
+        }
+        value = extractParam(payload, "H1T3TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].TZoneDesiredTemp[2] = value.toFloat();
@@ -717,7 +785,7 @@ void loop()
           Serial.printf("HEATER1 temp set for timezone [2]\r\n");
 #endif
         }
-        value = extractParam(payload, "H1CPADDR=", '&');
+        value = extractParam(payload, "H1CPADDR=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].PanelAddress = value.toInt();
@@ -726,7 +794,7 @@ void loop()
           Serial.printf("HEATER1 CP addr set %d\r\n", settings.HeaterConfig[0].PanelAddress);
 #endif
         }
-        value = extractParam(payload, "H1TSADDR=", '&');
+        value = extractParam(payload, "H1TSADDR=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].TermalSensorAddress = value.toInt();
@@ -734,7 +802,7 @@ void loop()
           Serial.printf("HEATER1 temp sensor addr set %d\r\n", settings.HeaterConfig[0].TermalSensorAddress);
 #endif
         }
-        value = extractParam(payload, "H1TOFFSET=", '&');
+        value = extractParam(payload, "H1TOFFSET=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].toffset = value.toFloat();
@@ -743,7 +811,7 @@ void loop()
           Serial.printf("HEATER1 temp offset set %f\r\n", settings.HeaterConfig[0].toffset);
 #endif
         }
-        value = extractParam(payload, "H1HOFFSET=", '&');
+        value = extractParam(payload, "H1HOFFSET=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].hoffset = value.toInt();
@@ -752,7 +820,7 @@ void loop()
           Serial.printf("HEATER1 humidity offset set %d\r\n", settings.HeaterConfig[0].hoffset);
 #endif
         }
-        value = extractParam(payload, "H1KP=", '&');
+        value = extractParam(payload, "H1KP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].Kp = value.toFloat();
@@ -761,7 +829,7 @@ void loop()
           Serial.printf("HEATER1 KP set %f\r\n", settings.HeaterConfig[0].Kp);
 #endif
         }
-        value = extractParam(payload, "H1KI=", '&');
+        value = extractParam(payload, "H1KI=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].Ki = value.toFloat();
@@ -770,7 +838,7 @@ void loop()
           Serial.printf("HEATER1 KI set %f\r\n", settings.HeaterConfig[0].Ki);
 #endif
         }
-        value = extractParam(payload, "H1KD=", '&');
+        value = extractParam(payload, "H1KD=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[0].Kd = value.toFloat();
@@ -779,8 +847,18 @@ void loop()
           Serial.printf("HEATER1 KD set %f\r\n", settings.HeaterConfig[0].Kd);
 #endif
         }
+        value = extractParam(payload, "H1HMC=");
+        if (value.length() > 0)
+        {
+          settings.HeaterConfig[0].DutyCyclesMax = value.toInt()/RUNCYCLE_FREQ;
+          if(settings.HeaterConfig[0].CurrentMode == HEATER_MODE_DUTYCYCLE) RunningValues[0].NumberOfCycles = 1;
+#ifdef DEBUG
+          Serial.printf("HEATER1 duty cycles period changed %d\r\n", settings.HeaterConfig[0].DutyCyclesMax);
+#endif
+        }
+
         //==============================PANEL 2 configuration ===============================
-        value = extractParam(payload, "H2MODE=", '&');
+        value = extractParam(payload, "H2MODE=");
         if (value.length() > 0)
         {
           uint8_t prevmode = settings.HeaterConfig[1].CurrentMode;
@@ -795,13 +873,17 @@ void loop()
               PIDHeaterMachinery[1].Reset();
               PIDHeaterMachinery[1].SetMode(AUTOMATIC);
             }
+            else if(settings.HeaterConfig[1].CurrentMode == HEATER_MODE_DUTYCYCLE)
+            {
+              RunningValues[1].NumberOfCycles = 1;
+            }
             RunningValues[1].NeedPushConfig = true;
 #ifdef DEBUG
             Serial.printf("HEATER2 mode changed\r\n");
 #endif
           }
         }
-        value = extractParam(payload, "H2T1S=", '&');
+        value = extractParam(payload, "H2T1S=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].TZoneStart[0] = value.toInt();
@@ -809,7 +891,7 @@ void loop()
           Serial.printf("HEATER2 TimeZone[0]Start changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H2T1E=", '&');
+        value = extractParam(payload, "H2T1E=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].TZoneEnd[0] = value.toInt();
@@ -817,7 +899,7 @@ void loop()
           Serial.printf("HEATER2 TimeZone[0]End changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H2T2S=", '&');
+        value = extractParam(payload, "H2T2S=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].TZoneStart[1] = value.toInt();
@@ -825,7 +907,7 @@ void loop()
           Serial.printf("HEATER2 TimeZone[1]Start changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H2T2E=", '&');
+        value = extractParam(payload, "H2T2E=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].TZoneEnd[1] = value.toInt();
@@ -833,7 +915,7 @@ void loop()
           Serial.printf("HEATER2 TimeZone[1]End changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H2T3S=", '&');
+        value = extractParam(payload, "H2T3S=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].TZoneStart[2] = value.toInt();
@@ -841,7 +923,7 @@ void loop()
           Serial.printf("HEATER2 TimeZone[2]Start changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H2T3E=", '&');
+        value = extractParam(payload, "H2T3E=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].TZoneEnd[2] = value.toInt();
@@ -849,7 +931,7 @@ void loop()
           Serial.printf("HEATER2 TimeZone[2]End changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H2TEMP=", '&');
+        value = extractParam(payload, "H2TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].desiredTemp = value.toFloat();
@@ -858,23 +940,23 @@ void loop()
           Serial.printf("HEATER2 temp set %f\r\n", settings.HeaterConfig[1].desiredTemp);
 #endif
         }
-        value = extractParam(payload, "H2T1TEMP=", '&');
+        value = extractParam(payload, "H2T1TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].TZoneDesiredTemp[0] = value.toFloat();
 #ifdef DEBUG
           Serial.printf("HEATER2 temp set for timezone [0]\r\n");
 #endif
-        }                
-        value = extractParam(payload, "H2T2TEMP=", '&');
+        }
+        value = extractParam(payload, "H2T2TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].TZoneDesiredTemp[1] = value.toFloat();
 #ifdef DEBUG
           Serial.printf("HEATER2 temp set for timezone [1]\r\n");
 #endif
-        }                
-        value = extractParam(payload, "H2T3TEMP=", '&');
+        }
+        value = extractParam(payload, "H2T3TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].TZoneDesiredTemp[2] = value.toFloat();
@@ -882,7 +964,7 @@ void loop()
           Serial.printf("HEATER2 temp set for timezone [2]\r\n");
 #endif
         }
-        value = extractParam(payload, "H2CPADDR=", '&');
+        value = extractParam(payload, "H2CPADDR=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].PanelAddress = value.toInt();
@@ -891,7 +973,7 @@ void loop()
           Serial.printf("HEATER2 CP addr set %d\r\n", settings.HeaterConfig[1].PanelAddress);
 #endif
         }
-        value = extractParam(payload, "H2TSADDR=", '&');
+        value = extractParam(payload, "H2TSADDR=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].TermalSensorAddress = value.toInt();
@@ -899,7 +981,7 @@ void loop()
           Serial.printf("HEATER2 temp sensor addr set %d\r\n", settings.HeaterConfig[1].TermalSensorAddress);
 #endif
         }
-        value = extractParam(payload, "H2TOFFSET=", '&');
+        value = extractParam(payload, "H2TOFFSET=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].toffset = value.toFloat();
@@ -908,7 +990,7 @@ void loop()
           Serial.printf("HEATER2 temp offset set %f\r\n", settings.HeaterConfig[1].toffset);
 #endif
         }
-        value = extractParam(payload, "H2HOFFSET=", '&');
+        value = extractParam(payload, "H2HOFFSET=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].hoffset = value.toInt();
@@ -917,7 +999,7 @@ void loop()
           Serial.printf("HEATER2 humidity offset set %d\r\n", settings.HeaterConfig[1].hoffset);
 #endif
         }
-        value = extractParam(payload, "H2KP=", '&');
+        value = extractParam(payload, "H2KP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].Kp = value.toFloat();
@@ -926,7 +1008,7 @@ void loop()
           Serial.printf("HEATER2 KP set %f\r\n", settings.HeaterConfig[1].Kp);
 #endif
         }
-        value = extractParam(payload, "H2KI=", '&');
+        value = extractParam(payload, "H2KI=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].Ki = value.toFloat();
@@ -935,7 +1017,7 @@ void loop()
           Serial.printf("HEATER2 KI set %f\r\n", settings.HeaterConfig[1].Ki);
 #endif
         }
-        value = extractParam(payload, "H2KD=", '&');
+        value = extractParam(payload, "H2KD=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[1].Kd = value.toFloat();
@@ -944,8 +1026,18 @@ void loop()
           Serial.printf("HEATER2 KD set %f\r\n", settings.HeaterConfig[1].Kd);
 #endif
         }
+        value = extractParam(payload, "H2HMC=");
+        if (value.length() > 0)
+        {
+          settings.HeaterConfig[1].DutyCyclesMax = value.toInt()/RUNCYCLE_FREQ;
+          if(settings.HeaterConfig[1].CurrentMode == HEATER_MODE_DUTYCYCLE) RunningValues[1].NumberOfCycles = 1;
+#ifdef DEBUG
+          Serial.printf("HEATER2 duty cycles period changed %d\r\n", settings.HeaterConfig[1].DutyCyclesMax);
+#endif
+        }
+
         //==============================PANEL 3 configuration ===============================
-        value = extractParam(payload, "H3MODE=", '&');
+        value = extractParam(payload, "H3MODE=");
         if (value.length() > 0)
         {
           uint8_t prevmode = settings.HeaterConfig[2].CurrentMode;
@@ -960,13 +1052,17 @@ void loop()
               PIDHeaterMachinery[2].Reset();
               PIDHeaterMachinery[2].SetMode(AUTOMATIC);
             }
+            else if(settings.HeaterConfig[2].CurrentMode == HEATER_MODE_DUTYCYCLE)
+            {
+              RunningValues[2].NumberOfCycles = 1;
+            }
             RunningValues[2].NeedPushConfig = true;
 #ifdef DEBUG
             Serial.printf("HEATER3 mode changed\r\n");
 #endif
           }
         }
-        value = extractParam(payload, "H3T1S=", '&');
+        value = extractParam(payload, "H3T1S=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].TZoneStart[0] = value.toInt();
@@ -974,7 +1070,7 @@ void loop()
           Serial.printf("HEATER3 TimeZone[0]Start changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H3T1E=", '&');
+        value = extractParam(payload, "H3T1E=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].TZoneEnd[0] = value.toInt();
@@ -982,7 +1078,7 @@ void loop()
           Serial.printf("HEATER3 TimeZone[0]End changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H3T2S=", '&');
+        value = extractParam(payload, "H3T2S=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].TZoneStart[1] = value.toInt();
@@ -990,7 +1086,7 @@ void loop()
           Serial.printf("HEATER3 TimeZone[1]Start changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H3T2E=", '&');
+        value = extractParam(payload, "H3T2E=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].TZoneEnd[1] = value.toInt();
@@ -998,7 +1094,7 @@ void loop()
           Serial.printf("HEATER3 TimeZone[1]End changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H3T3S=", '&');
+        value = extractParam(payload, "H3T3S=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].TZoneStart[2] = value.toInt();
@@ -1006,7 +1102,7 @@ void loop()
           Serial.printf("HEATER3 TimeZone[2]Start changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H3T3E=", '&');
+        value = extractParam(payload, "H3T3E=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].TZoneEnd[2] = value.toInt();
@@ -1014,7 +1110,7 @@ void loop()
           Serial.printf("HEATER3 TimeZone[2]End changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H3TEMP=", '&');
+        value = extractParam(payload, "H3TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].desiredTemp = value.toFloat();
@@ -1023,23 +1119,23 @@ void loop()
           Serial.printf("HEATER3 temp set %f\r\n", settings.HeaterConfig[2].desiredTemp);
 #endif
         }
-        value = extractParam(payload, "H3T1TEMP=", '&');
+        value = extractParam(payload, "H3T1TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].TZoneDesiredTemp[0] = value.toFloat();
 #ifdef DEBUG
           Serial.printf("HEATER3 temp set for timezone [0]\r\n");
 #endif
-        }                
-        value = extractParam(payload, "H3T2TEMP=", '&');
+        }
+        value = extractParam(payload, "H3T2TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].TZoneDesiredTemp[1] = value.toFloat();
 #ifdef DEBUG
           Serial.printf("HEATER3 temp set for timezone [1]\r\n");
 #endif
-        }                
-        value = extractParam(payload, "H3T3TEMP=", '&');
+        }
+        value = extractParam(payload, "H3T3TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].TZoneDesiredTemp[2] = value.toFloat();
@@ -1047,7 +1143,7 @@ void loop()
           Serial.printf("HEATER3 temp set for timezone [2]\r\n");
 #endif
         }
-        value = extractParam(payload, "H3CPADDR=", '&');
+        value = extractParam(payload, "H3CPADDR=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].PanelAddress = value.toInt();
@@ -1056,7 +1152,7 @@ void loop()
           Serial.printf("HEATER3 CP addr set %d\r\n", settings.HeaterConfig[2].PanelAddress);
 #endif
         }
-        value = extractParam(payload, "H3TSADDR=", '&');
+        value = extractParam(payload, "H3TSADDR=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].TermalSensorAddress = value.toInt();
@@ -1064,7 +1160,7 @@ void loop()
           Serial.printf("HEATER3 temp sensor addr set %d\r\n", settings.HeaterConfig[2].TermalSensorAddress);
 #endif
         }
-        value = extractParam(payload, "H3TOFFSET=", '&');
+        value = extractParam(payload, "H3TOFFSET=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].toffset = value.toFloat();
@@ -1073,7 +1169,7 @@ void loop()
           Serial.printf("HEATER3 temp offset set %f\r\n", settings.HeaterConfig[2].toffset);
 #endif
         }
-        value = extractParam(payload, "H3HOFFSET=", '&');
+        value = extractParam(payload, "H3HOFFSET=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].hoffset = value.toInt();
@@ -1082,7 +1178,7 @@ void loop()
           Serial.printf("HEATER3 humidity offset set %d\r\n", settings.HeaterConfig[2].hoffset);
 #endif
         }
-        value = extractParam(payload, "H3KP=", '&');
+        value = extractParam(payload, "H3KP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].Kp = value.toFloat();
@@ -1091,7 +1187,7 @@ void loop()
           Serial.printf("HEATER3 KP set %f\r\n", settings.HeaterConfig[2].Kp);
 #endif
         }
-        value = extractParam(payload, "H3KI=", '&');
+        value = extractParam(payload, "H3KI=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].Ki = value.toFloat();
@@ -1100,7 +1196,7 @@ void loop()
           Serial.printf("HEATER3 KI set %f\r\n", settings.HeaterConfig[2].Ki);
 #endif
         }
-        value = extractParam(payload, "H3KD=", '&');
+        value = extractParam(payload, "H3KD=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[2].Kd = value.toFloat();
@@ -1109,8 +1205,18 @@ void loop()
           Serial.printf("HEATER3 KD set %f\r\n", settings.HeaterConfig[2].Kd);
 #endif
         }
+        value = extractParam(payload, "H3HMC=");
+        if (value.length() > 0)
+        {
+          settings.HeaterConfig[2].DutyCyclesMax = value.toInt()/RUNCYCLE_FREQ;
+          if(settings.HeaterConfig[2].CurrentMode == HEATER_MODE_DUTYCYCLE) RunningValues[2].NumberOfCycles = 1;
+#ifdef DEBUG
+          Serial.printf("HEATER3 duty cycles period changed %d\r\n", settings.HeaterConfig[2].DutyCyclesMax);
+#endif
+        }
+
         //==============================PANEL 4 configuration ===============================
-        value = extractParam(payload, "H4MODE=", '&');
+        value = extractParam(payload, "H4MODE=");
         if (value.length() > 0)
         {
           uint8_t prevmode = settings.HeaterConfig[3].CurrentMode;
@@ -1125,13 +1231,17 @@ void loop()
               PIDHeaterMachinery[3].Reset();
               PIDHeaterMachinery[3].SetMode(AUTOMATIC);
             }
+            else if(settings.HeaterConfig[3].CurrentMode == HEATER_MODE_DUTYCYCLE)
+            {
+              RunningValues[3].NumberOfCycles = 1;
+            }
             RunningValues[3].NeedPushConfig = true;
 #ifdef DEBUG
             Serial.printf("HEATER4 mode changed\r\n");
 #endif
           }
         }
-        value = extractParam(payload, "H4T1S=", '&');
+        value = extractParam(payload, "H4T1S=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].TZoneStart[0] = value.toInt();
@@ -1139,7 +1249,7 @@ void loop()
           Serial.printf("HEATER4 TimeZone[0]Start changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H4T1E=", '&');
+        value = extractParam(payload, "H4T1E=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].TZoneEnd[0] = value.toInt();
@@ -1147,7 +1257,7 @@ void loop()
           Serial.printf("HEATER4 TimeZone[0]End changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H4T2S=", '&');
+        value = extractParam(payload, "H4T2S=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].TZoneStart[1] = value.toInt();
@@ -1155,7 +1265,7 @@ void loop()
           Serial.printf("HEATER4 TimeZone[1]Start changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H4T2E=", '&');
+        value = extractParam(payload, "H4T2E=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].TZoneEnd[1] = value.toInt();
@@ -1163,7 +1273,7 @@ void loop()
           Serial.printf("HEATER4 TimeZone[1]End changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H4T3S=", '&');
+        value = extractParam(payload, "H4T3S=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].TZoneStart[2] = value.toInt();
@@ -1171,7 +1281,7 @@ void loop()
           Serial.printf("HEATER4 TimeZone[2]Start changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H4T3E=", '&');
+        value = extractParam(payload, "H4T3E=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].TZoneEnd[2] = value.toInt();
@@ -1179,7 +1289,7 @@ void loop()
           Serial.printf("HEATER4 TimeZone[2]End changed\r\n");
 #endif
         }
-        value = extractParam(payload, "H4TEMP=", '&');
+        value = extractParam(payload, "H4TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].desiredTemp = value.toFloat();
@@ -1188,23 +1298,23 @@ void loop()
           Serial.printf("HEATER4 temp set %f\r\n", settings.HeaterConfig[3].desiredTemp);
 #endif
         }
-        value = extractParam(payload, "H4T1TEMP=", '&');
+        value = extractParam(payload, "H4T1TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].TZoneDesiredTemp[0] = value.toFloat();
 #ifdef DEBUG
           Serial.printf("HEATER4 temp set for timezone [0]\r\n");
 #endif
-        }                
-        value = extractParam(payload, "H4T2TEMP=", '&');
+        }
+        value = extractParam(payload, "H4T2TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].TZoneDesiredTemp[1] = value.toFloat();
 #ifdef DEBUG
           Serial.printf("HEATER4 temp set for timezone [1]\r\n");
 #endif
-        }                
-        value = extractParam(payload, "H4T3TEMP=", '&');
+        }
+        value = extractParam(payload, "H4T3TEMP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].TZoneDesiredTemp[2] = value.toFloat();
@@ -1212,7 +1322,7 @@ void loop()
           Serial.printf("HEATER4 temp set for timezone [2]\r\n");
 #endif
         }
-        value = extractParam(payload, "H4CPADDR=", '&');
+        value = extractParam(payload, "H4CPADDR=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].PanelAddress = value.toInt();
@@ -1221,7 +1331,7 @@ void loop()
           Serial.printf("HEATER4 CP addr set %d\r\n", settings.HeaterConfig[3].PanelAddress);
 #endif
         }
-        value = extractParam(payload, "H4TSADDR=", '&');
+        value = extractParam(payload, "H4TSADDR=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].TermalSensorAddress = value.toInt();
@@ -1229,7 +1339,7 @@ void loop()
           Serial.printf("HEATER4 temp sensor addr set %d\r\n", settings.HeaterConfig[3].TermalSensorAddress);
 #endif
         }
-        value = extractParam(payload, "H4TOFFSET=", '&');
+        value = extractParam(payload, "H4TOFFSET=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].toffset = value.toFloat();
@@ -1238,7 +1348,7 @@ void loop()
           Serial.printf("HEATER4 temp offset set %f\r\n", settings.HeaterConfig[3].toffset);
 #endif
         }
-        value = extractParam(payload, "H4HOFFSET=", '&');
+        value = extractParam(payload, "H4HOFFSET=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].hoffset = value.toInt();
@@ -1247,7 +1357,7 @@ void loop()
           Serial.printf("HEATER4 humidity offset set %d\r\n", settings.HeaterConfig[3].hoffset);
 #endif
         }
-        value = extractParam(payload, "H4KP=", '&');
+        value = extractParam(payload, "H4KP=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].Kp = value.toFloat();
@@ -1256,7 +1366,7 @@ void loop()
           Serial.printf("HEATER4 KP set %f\r\n", settings.HeaterConfig[3].Kp);
 #endif
         }
-        value = extractParam(payload, "H4KI=", '&');
+        value = extractParam(payload, "H4KI=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].Ki = value.toFloat();
@@ -1265,7 +1375,7 @@ void loop()
           Serial.printf("HEATER4 KI set %f\r\n", settings.HeaterConfig[3].Ki);
 #endif
         }
-        value = extractParam(payload, "H4KD=", '&');
+        value = extractParam(payload, "H4KD=");
         if (value.length() > 0)
         {
           settings.HeaterConfig[3].Kd = value.toFloat();
@@ -1274,100 +1384,185 @@ void loop()
           Serial.printf("HEATER4 KD set %f\r\n", settings.HeaterConfig[3].Kd);
 #endif
         }
-      }
-      //set next connect timestamp
-      dt = Rtc.GetDateTime();
-      nextTimeConnect = dt.TotalSeconds() + settings.ConnInterval;
-    }
-    //missed connect let's retry fastly
-    else
-    {
+        value = extractParam(payload, "H4HMC=");
+        if (value.length() > 0)
+        {
+          settings.HeaterConfig[3].DutyCyclesMax = value.toInt()/RUNCYCLE_FREQ;
+          if(settings.HeaterConfig[3].CurrentMode == HEATER_MODE_DUTYCYCLE) RunningValues[3].NumberOfCycles = 1;
 #ifdef DEBUG
-      Serial.printf("missing WIFI connection, will retry 10seconds later\r\n");
+          Serial.printf("HEATER4 duty cycles period changed %d\r\n", settings.HeaterConfig[3].DutyCyclesMax);
 #endif
-      dt = Rtc.GetDateTime();
-      nextTimeConnect = dt.TotalSeconds() + 10;
-    }
-    ShutdownWIFI();
-  }
-
-  //determine how much seconds we allowed to powerdown MCU?
-  //either WIFI or RUN cycles come first
-  int32_t seconds = 0;
-#ifdef DEBUG
-  Serial.printf("nextTimeConnect=%d  NextRunCycleTS=%d\r\n", nextTimeConnect, NextRunCycleTS);
-#endif
-  if (nextTimeConnect > NextRunCycleTS)
-  {
-    seconds = NextRunCycleTS - dt.TotalSeconds();
-  }
-  else
-  {
-    seconds = nextTimeConnect - dt.TotalSeconds();
-  }
-
-  if (seconds > 0)
-  {
-#ifdef DEBUG
-    Serial.printf("allowed powerdown for %d seconds\r\n", seconds);
-#endif
-    esp_sleep_enable_timer_wakeup(seconds * 1000000);
-
-#ifdef DEBUG
-    for (int a = 0; a < 4; a++) Serial.printf("[%d] = %d\r\n", a, digitalRead(RunningValues[a].Pin));
-#endif    
-    if (digitalRead(GPIO_NUM_26))
-      gpio_hold_en(GPIO_NUM_26);
-    if (digitalRead(GPIO_NUM_25))
-      gpio_hold_en(GPIO_NUM_25);
-    if (digitalRead(GPIO_NUM_33))
-      gpio_hold_en(GPIO_NUM_33);
-    if (digitalRead(GPIO_NUM_32))
-      gpio_hold_en(GPIO_NUM_32);
-
-    gpio_deep_sleep_hold_en();
-    WiFi.mode(WIFI_OFF);
-
-    esp_light_sleep_start();
-#ifdef DEBUG
-    Serial.println("waked from powerdown GPIO states:\r\n");
-    for (int a = 0; a < 4; a++) Serial.printf("[%d] = %d\r\n", a, digitalRead(RunningValues[a].Pin));
-#endif
-
-    gpio_hold_dis(GPIO_NUM_26);
-    gpio_hold_dis(GPIO_NUM_25);
-    gpio_hold_dis(GPIO_NUM_33);
-    gpio_hold_dis(GPIO_NUM_32);
-
-#ifdef DEBUG
-    Serial.println("after gpio_hold_dis\r\n");
-    for (int a = 0; a < 4; a++) Serial.printf("[%d] = %d\r\n", a, digitalRead(RunningValues[a].Pin));
-#endif
-  }
+        }
 }
 
-
-double *GetSetTempForZone(uint8_t PanelIdx, uint32_t CurTime)
+bool AssignProperSetTemp(uint8_t PanelIdx, uint32_t CurTime)
 {
     if(settings.HeaterConfig[PanelIdx].CurrentMode == HEATER_MODE_PID_MULTIZONE)
     {
         for(uint8_t a=0;a<3;a++)
         {
-            if(is_between(CurTime, settings.HeaterConfig[PanelIdx].TZoneStart[a], settings.HeaterConfig[PanelIdx].TZoneEnd[a])) 
+            if(is_between(CurTime, settings.HeaterConfig[PanelIdx].TZoneStart[a], settings.HeaterConfig[PanelIdx].TZoneEnd[a]))
             {
 #ifdef DEBUG
                   Serial.printf("HEATER%d matched timezone from %d to %d  SetPoint=%f\r\n", PanelIdx, settings.HeaterConfig[PanelIdx].TZoneStart[a], settings.HeaterConfig[PanelIdx].TZoneEnd[a], settings.HeaterConfig[PanelIdx].TZoneDesiredTemp[a]);
 #endif
-                  return &(settings.HeaterConfig[PanelIdx].TZoneDesiredTemp[a]);
+                  //
+                  if(*RunningValues[PanelIdx].ptrToCurSettemp != settings.HeaterConfig[PanelIdx].TZoneDesiredTemp[a])
+                  {
+#ifdef DEBUG
+                    Serial.printf("comparing OLD (cur) settemp with next one DIFFERENT -> force panel pushing config\r\n");
+#endif
+                    RunningValues[PanelIdx].ptrToCurSettemp = &(settings.HeaterConfig[PanelIdx].TZoneDesiredTemp[a]);
+                    return true;
+                  }
+                  return false;
             }
-        }        
+        }
     }
 
 #ifdef DEBUG
     Serial.printf("HEATER%d default SetPoint=%f\r\n", PanelIdx, settings.HeaterConfig[PanelIdx].desiredTemp);
 #endif
 
-    return &(settings.HeaterConfig[PanelIdx].desiredTemp);
+    if(*RunningValues[PanelIdx].ptrToCurSettemp != settings.HeaterConfig[PanelIdx].desiredTemp)
+    {
+#ifdef DEBUG
+          Serial.printf("comparing OLD (cur) settemp with next one DIFFERENT -> force panel pushing config\r\n");
+#endif
+      RunningValues[PanelIdx].ptrToCurSettemp = &(settings.HeaterConfig[PanelIdx].desiredTemp);
+      return true;
+    }
+
+    return false;
+}
+
+void SpinPIDHeatersCycle(uint32_t CurTS)
+{
+    for (uint8_t idx = 0; idx < 4; idx++)
+    {
+      if (settings.HeaterConfig[idx].CurrentMode == HEATER_MODE_OFF)
+      {
+#ifdef DEBUG
+        Serial.printf("HEATER%d MANUAL OFF on GPIO %d\r\n", idx, RunningValues[idx].Pin);
+#endif
+        uint32_t delta = CurTS - RunningValues[idx].LastuseTS;
+        //if we really not heating for a long time -> do heat cycle
+        if(delta > VALVE_INACTIVE_MAX_SECONDS &&
+           delta < (VALVE_INACTIVE_MAX_SECONDS + VALVE_MAINTENANCE_SECONDS))
+        {
+#ifdef DEBUG
+          Serial.printf("HEATER%d %d we  don't turned on for long time. MAINTENANCE is ON\r\n", idx);
+#endif
+          digitalWrite(RunningValues[idx].Pin, HIGH);
+                  RunningValues[idx].OnTimeCount += RUNCYCLE_FREQ;
+        }
+        //we already turned ON temporary heating, now we past it's duration (10 minutes)
+        else if(delta > (VALVE_INACTIVE_MAX_SECONDS + VALVE_MAINTENANCE_SECONDS))
+        {
+#ifdef DEBUG
+          Serial.printf("HEATER%d MAINTENANCE cycle is OFF, updating last use time\r\n", idx);
+#endif
+          digitalWrite(RunningValues[idx].Pin, LOW);
+          RunningValues[idx].LastuseTS = CurTS;
+        }
+        else
+        {
+          digitalWrite(RunningValues[idx].Pin, LOW);
+        }
+      }
+      //PID loop calibration loop mode
+      else if (settings.HeaterConfig[idx].CurrentMode == HEATER_MODE_PIDTUNE)
+      {
+          if (PIDHeaterMachinery[idx].ATCompute())
+          {
+#ifdef DEBUG
+          Serial.printf("HEATER%d Autotune DONE\r\n", idx);
+#endif
+            //was done, get P I D values
+            RunningValues[idx].PIDTuneReady = true;
+            settings.HeaterConfig[idx].CurrentMode = HEATER_MODE_OFF;
+            //flag: in NEXT polling cycle we should push new settings to panel
+            RunningValues[idx].NeedPushConfig = true;
+          }
+
+          if ((RunningValues[idx].output * VALVE_PWM_CYCLES) / 100 >= RunningValues[idx].NumberOfCycles)
+          {
+#ifdef DEBUG
+            Serial.printf("PIDCal HEATER%d PID.input=%f PID.output=%f Cycles=%d ON\r\n", idx, RunningValues[idx].input, RunningValues[idx].output, RunningValues[idx].NumberOfCycles);
+#endif
+            digitalWrite(RunningValues[idx].Pin, HIGH);
+            RunningValues[idx].OnTimeCount += RUNCYCLE_FREQ;
+          }
+          else
+          {
+#ifdef DEBUG
+            Serial.printf("PIDCal HEATER%d PID.input=%f PID.output=%f Cycles=%d OFF\r\n", idx, RunningValues[idx].input, RunningValues[idx].output, RunningValues[idx].NumberOfCycles);
+#endif
+            digitalWrite(RunningValues[idx].Pin, LOW);
+          }
+          RunningValues[idx].NumberOfCycles++;
+          if(RunningValues[idx].NumberOfCycles > VALVE_PWM_CYCLES) RunningValues[idx].NumberOfCycles=1;
+      }
+      //PID heating two modes
+      else if (settings.HeaterConfig[idx].CurrentMode >= HEATER_MODE_PID_SINGLEZONE && settings.HeaterConfig[idx].CurrentMode <= HEATER_MODE_PID_MULTIZONE)
+      {
+          PIDHeaterMachinery[idx].Compute(RunningValues[idx].ptrToCurSettemp);
+
+          if ((RunningValues[idx].output * VALVE_PWM_CYCLES) / 100 >= RunningValues[idx].NumberOfCycles)
+          {
+#ifdef DEBUG
+            Serial.printf("HEATER%d PID.input=%f PID.output=%f SetPoint=%f Cycles=%d ON\r\n", idx, RunningValues[idx].input, RunningValues[idx].output, *RunningValues[idx].ptrToCurSettemp, RunningValues[idx].NumberOfCycles);
+#endif
+            digitalWrite(RunningValues[idx].Pin, HIGH);
+            RunningValues[idx].OnTimeCount += RUNCYCLE_FREQ;
+          }
+          else
+          {
+#ifdef DEBUG
+            Serial.printf("HEATER%d PID.input=%f PID.output=%f SetPoint=%f Cycles=%d OFF\r\n", idx, RunningValues[idx].input, RunningValues[idx].output, *RunningValues[idx].ptrToCurSettemp, RunningValues[idx].NumberOfCycles);
+#endif
+            digitalWrite(RunningValues[idx].Pin, LOW);
+          }
+          RunningValues[idx].NumberOfCycles++;
+          if(RunningValues[idx].NumberOfCycles > VALVE_PWM_CYCLES) RunningValues[idx].NumberOfCycles=1;
+      }
+      //DUTY CYCLE HEATING MODE
+      else if(settings.HeaterConfig[idx].CurrentMode == HEATER_MODE_DUTYCYCLE)
+      {
+          //first part of range we turned ON
+          if(RunningValues[idx].NumberOfCycles <= settings.HeaterConfig[idx].DutyCyclesMax)
+          {
+#ifdef DEBUG
+              Serial.printf("HEATER%d DUTY CYCLE MODE on\r\n", idx);
+#endif
+              digitalWrite(RunningValues[idx].Pin, HIGH);
+              RunningValues[idx].OnTimeCount += RUNCYCLE_FREQ;
+          }
+          //second part of range we turned OFF
+          else  //if(RunningValues[idx].NumberOfCycles > settings.HeaterConfig[idx].DutyCyclesMax)
+          {
+#ifdef DEBUG
+              Serial.printf("HEATER%d DUTY CYCLE MODE off\r\n", idx);
+#endif
+              digitalWrite(RunningValues[idx].Pin, LOW);
+          }
+          RunningValues[idx].NumberOfCycles++;
+          if(RunningValues[idx].NumberOfCycles > (settings.HeaterConfig[idx].DutyCyclesMax*2)) RunningValues[idx].NumberOfCycles=1;
+      }
+    }
+}
+
+void UpdateHeatersLastuse(uint32_t TS)
+{
+    for(uint8_t idx=0;idx<4;idx++)
+    {
+      //set heater last use time to current if it's have some ONtime. we ignore small intervals here
+      if(settings.HeaterConfig[idx].CurrentMode != HEATER_MODE_OFF &&
+             RunningValues[idx].OnTimeCount > RUNCYCLE_FREQ)
+      {
+        RunningValues[idx].LastuseTS = TS;
+      }
+    }
 }
 
 uint8_t GetDeviceIndex(const int32_t HWAddress)
@@ -1422,18 +1617,19 @@ void ScanOWBus()
         settings.HeaterConfig[PanelIdx].PanelAddress = OneWireBus.getDeviceHWAddress(i);
       }
 
+      if(!PushToControlPanel(PanelIdx, i))
+      {
 #ifdef DEBUG
-      if(PushToControlPanel(PanelIdx, i))
+        Serial.printf("PUSH slave #%d (our idx=%d) error!\r\n", i, PanelIdx);
+#endif
+        RunningValues[PanelIdx].NeedPushConfig = true; //flag to continue pushing later
+      }
+#ifdef DEBUG
+      else
       {
         Serial.printf("PUSH slave #%d (our idx=%d) success\r\n", i, PanelIdx);
       }
-      else
-      {
-        Serial.printf("PUSH slave #%d (our idx=%d) error!\r\n", i, PanelIdx);
-      }
-#else
-      PushToControlPanel(PanelIdx, i);
-#endif	  
+#endif
       PanelIdx++;
     }
     else
@@ -1560,6 +1756,7 @@ void loadSettings()
       settings.HeaterConfig[a].PanelAddress = 0;
       settings.HeaterConfig[a].TermalSensorAddress = 0;
       settings.HeaterConfig[a].CurrentMode = HEATER_MODE_OFF;
+      settings.HeaterConfig[a].DutyCyclesMax = VALVE_MAINTENANCE_SECONDS/RUNCYCLE_FREQ; //minimum valve open-close cycle time equal to maintenance time
       for (uint8_t b = 0; b < 3; b++)
       {
           settings.HeaterConfig[a].TZoneStart[b] = 25200;
@@ -1577,7 +1774,7 @@ void loadSettings()
   }
 
   //common running counters initialize
-  for (int a = 0; a < 4; a++)
+  for (uint8_t a = 0; a < 4; a++)
   {
     RunningValues[a].input = 0.0;
     RunningValues[a].output = 0.0;
@@ -1587,6 +1784,7 @@ void loadSettings()
     RunningValues[a].SensorlastOnline = 0;
     RunningValues[a].PanelErrorsOnBus = 0;
     RunningValues[a].SensorErrorsOnBus = 0;
+    RunningValues[a].LastuseTS = 0;
     RunningValues[a].OnTimeCount = 0;
     RunningValues[a].NumberOfCycles = 1;
     RunningValues[a].PIDTuneReady = false;
@@ -1659,24 +1857,24 @@ unsigned int CRC16(unsigned char *buf, int len)
   return crc;
 }
 
-String extractParam(String & authReq, const String & param, const char delimit)
+String extractParam(const String &authReq, const String &param)
 {
   int _begin = authReq.indexOf(param);
   if (_begin == -1)
     return "";
-  return authReq.substring(_begin + param.length(), authReq.indexOf(delimit, _begin + param.length()));
+  return authReq.substring(_begin + param.length(), authReq.indexOf('&', _begin + param.length()));
 }
 
 float getVBatt()
 {
-  int32_t Raw=0;
+  uint32_t Raw=0;
   float voltage;
 
   adc1_config_width(ADC_WIDTH_12Bit);
   adc1_config_channel_atten(ADC1_CHANNEL_0,ADC_ATTEN_0db);
-  
+
   //sample average
-  for(int i = 0; i < 100; i++) Raw += adc1_get_voltage(ADC1_CHANNEL_0);
+  for(int i = 0; i < 100; i++) Raw += adc1_get_raw(ADC1_CHANNEL_0);
   voltage = Raw / 100.0f;
 
 #ifdef DEBUG
@@ -1688,6 +1886,6 @@ float getVBatt()
 #ifdef DEBUG
     Serial.printf("ADC1 flattened %f\r\n", voltage);
 #endif
-  
+
   return voltage;
 }

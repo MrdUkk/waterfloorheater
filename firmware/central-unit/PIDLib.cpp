@@ -181,7 +181,7 @@ void PID::ATInitialize(double* Input, double* Output)
 {
   AutoTuneData.input = Input;
   AutoTuneData.output = Output;
-  AutoTuneData.controlType = 0 ; //default to PI
+  AutoTuneData.controlType = 1 ; //default to PI
   AutoTuneData.noiseBand = 0.5;
   AutoTuneData.running = false;
   AutoTuneData.oStep = 30;

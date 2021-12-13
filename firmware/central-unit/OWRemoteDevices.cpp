@@ -9,7 +9,7 @@
 #include "OWRemoteDevices.h"
 
 OWRemoteDevices::OWRemoteDevices() {}
-OWRemoteDevices::OWRemoteDevices(DS2482* _DS2482)
+OWRemoteDevices::OWRemoteDevices(MYDS2482* _DS2482)
 
 {
   _wire = _DS2482;
@@ -161,7 +161,11 @@ bool OWRemoteDevices::writeScratchPad(const uint8_t DeviceIndex, const uint8_t* 
   }
 
   //if (parasitePwr) delay(10); // 10ms delay
-  _wire->wireReset();
+  if (_wire->wireReset() == 0)
+  {
+    SlaveDevices[DeviceIndex].ErrorsCnt++;
+    return false;
+  }
 
   return true;
 }
@@ -185,7 +189,7 @@ bool OWRemoteDevices::setResolution(const uint8_t DeviceIndex, uint8_t newResolu
 {
   if (SlaveDevices[DeviceIndex].Address[0] == DS18S20MODEL) return false;
   if (SlaveDevices[DeviceIndex].Address[0] == OURMODEL) return false;
-  
+
   // ensure same behavior as setResolution(uint8_t newResolution)
   newResolution = constrain(newResolution, 9, 12);
 
@@ -226,7 +230,7 @@ uint8_t OWRemoteDevices::getResolution(const uint8_t DeviceIndex)
   // DS1820 and DS18S20 have no resolution configuration register
   if (SlaveDevices[DeviceIndex].Address[0] == DS18S20MODEL) return 12;
   if (SlaveDevices[DeviceIndex].Address[0] == OURMODEL) return 0;
-  
+
   ScratchPad scratchPad;
   if (!isConnected(DeviceIndex, scratchPad)) return 0;
 
@@ -242,6 +246,7 @@ uint8_t OWRemoteDevices::getResolution(const uint8_t DeviceIndex)
       return 10;
 
     case TEMP_9_BIT:
+    default:
       return 9;
   }
 }
@@ -300,24 +305,24 @@ bool OWRemoteDevices::GetPanelData(uint8_t deviceIndex, ControlPanelData *datapt
   return true;
 }
 
-void OWRemoteDevices::SetPanelData(uint8_t deviceIndex, ControlPanelData *dataptr)
+bool OWRemoteDevices::SetPanelData(uint8_t deviceIndex, ControlPanelData *dataptr)
 {
   ScratchPad scratchPad;
-  if (isConnected(deviceIndex, scratchPad))
-  {
-    uint16_t val = dataptr->ReqTemp * 100.0f;
-    scratchPad[0] = 0;
-    scratchPad[1] = 0;
-    scratchPad[2] = (byte)val;
-    scratchPad[3] = (byte)(val >> 8);
-    scratchPad[4] = (byte)(dataptr->CurHumidity & 255); //humidity offset -100+100
-    scratchPad[5] = (byte)dataptr->CurMode;
-    int16_t val2 = dataptr->toffset * 100.0f;  //temperature offset -5.0+5.0
-    scratchPad[6] = (byte)(val2 & 255);
-    scratchPad[7] = (byte)(val2 >> 8);
-    scratchPad[8] = _wire->crc8(scratchPad, 8);
-    writeScratchPad(deviceIndex, scratchPad);
-  }
+  
+  uint16_t val = dataptr->ReqTemp * 100.0f;
+  scratchPad[0] = 0;
+  scratchPad[1] = 0;
+  scratchPad[2] = (byte)val;
+  scratchPad[3] = (byte)(val >> 8);
+  scratchPad[4] = (byte)(dataptr->CurHumidity & 255); //humidity offset -100+100
+  scratchPad[5] = (byte)dataptr->CurMode;
+  int16_t val2 = dataptr->toffset * 100.0f;  //temperature offset -5.0+5.0
+  scratchPad[6] = (byte)(val2 & 255);
+  scratchPad[7] = (byte)(val2 >> 8);
+  scratchPad[8] = _wire->crc8(scratchPad, 8);
+  if(writeScratchPad(deviceIndex, scratchPad)) return true;
+  
+  return false;
 }
 
 // reads scratchpad and returns fixed-point temperature, scaling factor 2^-7
